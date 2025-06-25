@@ -3,23 +3,9 @@ from a2a.server.events import EventQueue
 from a2a.utils import new_agent_text_message
 
 
-# --8<-- [start:HelloWorldAgent]
-class HelloWorldAgent:
-    """Hello World Agent."""
-
-    async def invoke(self) -> str:
-        return 'Hello World'
-
-
-# --8<-- [end:HelloWorldAgent]
-
-
 # --8<-- [start:HelloWorldAgentExecutor_init]
 class HelloWorldAgentExecutor(AgentExecutor):
     """Test AgentProxy Implementation."""
-
-    def __init__(self):
-        self.agent = HelloWorldAgent()
 
     # --8<-- [end:HelloWorldAgentExecutor_init]
     # --8<-- [start:HelloWorldAgentExecutor_execute]
@@ -28,8 +14,17 @@ class HelloWorldAgentExecutor(AgentExecutor):
         context: RequestContext,
         event_queue: EventQueue,
     ) -> None:
-        result = await self.agent.invoke()
-        await event_queue.enqueue_event(new_agent_text_message(result))
+        # Echo back the received text
+        query = context.get_user_input()
+
+        if query:
+            # Echo back the received text
+            await event_queue.enqueue_event(new_agent_text_message(query))
+        else:
+            # Handle cases where the message might be empty or malformed
+            await event_queue.enqueue_event(
+                new_agent_text_message('No message content found.')
+            )
 
     # --8<-- [end:HelloWorldAgentExecutor_execute]
 

@@ -1,142 +1,167 @@
+import asyncio
+import base64
 import logging
-
-from typing import Any
+import os
+import statistics
+import time
+from typing import Any, Dict, List
 from uuid import uuid4
 
 import httpx
-
 from a2a.client import A2ACardResolver, A2AClient
 from a2a.types import (
     AgentCard,
+    Message,
     MessageSendParams,
+    Part,
     SendMessageRequest,
-    SendStreamingMessageRequest,
+    SendMessageSuccessResponse,
+    TextPart,
 )
+
+# --- Test Configuration ---
+PAYLOAD_SIZES_KB = [1, 4, 16, 64]  # In Kilobytes
+PAYLOAD_SIZES_BYTES = [s * 1024 for s in PAYLOAD_SIZES_KB]
+NUM_ITERATIONS = 10  # Number of tests per payload size
+REPORT_FILE = 'latency_report.md'
 
 
 async def main() -> None:
-    PUBLIC_AGENT_CARD_PATH = '/.well-known/agent.json'
-    EXTENDED_AGENT_CARD_PATH = '/agent/authenticatedExtendedCard'
-
-    # Configure logging to show INFO level messages
+    """
+    Main function to run the latency test client.
+    """
     logging.basicConfig(level=logging.INFO)
-    logger = logging.getLogger(__name__)  # Get a logger instance
-
-    # --8<-- [start:A2ACardResolver]
+    logger = logging.getLogger(__name__)
 
     base_url = 'http://localhost:9999'
+    all_results: Dict[int, Dict[str, Any]] = {}
 
-    async with httpx.AsyncClient() as httpx_client:
-        # Initialize A2ACardResolver
-        resolver = A2ACardResolver(
-            httpx_client=httpx_client,
-            base_url=base_url,
-            # agent_card_path uses default, extended_agent_card_path also uses default
-        )
-        # --8<-- [end:A2ACardResolver]
-
-        # Fetch Public Agent Card and Initialize Client
-        final_agent_card_to_use: AgentCard | None = None
-
+    async with httpx.AsyncClient(timeout=60.0) as httpx_client:
         try:
-            logger.info(
-                f'Attempting to fetch public agent card from: {base_url}{PUBLIC_AGENT_CARD_PATH}'
-            )
-            _public_card = (
-                await resolver.get_agent_card()
-            )  # Fetches from default public path
-            logger.info('Successfully fetched public agent card:')
-            logger.info(
-                _public_card.model_dump_json(indent=2, exclude_none=True)
-            )
-            final_agent_card_to_use = _public_card
-            logger.info(
-                '\nUsing PUBLIC agent card for client initialization (default).'
-            )
+            # --- Agent Card Resolution ---
+            logger.info('Resolving agent card...')
+            resolver = A2ACardResolver(httpx_client=httpx_client, base_url=base_url)
+            agent_card: AgentCard = await resolver.get_agent_card()
+            logger.info(f'Successfully resolved agent card: {agent_card.name}')
 
-            if _public_card.supportsAuthenticatedExtendedCard:
-                try:
-                    logger.info(
-                        f'\nPublic card supports authenticated extended card. Attempting to fetch from: {base_url}{EXTENDED_AGENT_CARD_PATH}'
-                    )
-                    auth_headers_dict = {
-                        'Authorization': 'Bearer dummy-token-for-extended-card'
-                    }
-                    _extended_card = await resolver.get_agent_card(
-                        relative_card_path=EXTENDED_AGENT_CARD_PATH,
-                        http_kwargs={'headers': auth_headers_dict},
-                    )
-                    logger.info(
-                        'Successfully fetched authenticated extended agent card:'
-                    )
-                    logger.info(
-                        _extended_card.model_dump_json(
-                            indent=2, exclude_none=True
-                        )
-                    )
-                    final_agent_card_to_use = (
-                        _extended_card  # Update to use the extended card
-                    )
-                    logger.info(
-                        '\nUsing AUTHENTICATED EXTENDED agent card for client initialization.'
-                    )
-                except Exception as e_extended:
-                    logger.warning(
-                        f'Failed to fetch extended agent card: {e_extended}. Will proceed with public card.',
-                        exc_info=True,
-                    )
-            elif (
-                _public_card
-            ):  # supportsAuthenticatedExtendedCard is False or None
-                logger.info(
-                    '\nPublic card does not indicate support for an extended card. Using public card.'
-                )
+            client = A2AClient(httpx_client=httpx_client, agent_card=agent_card)
+            logger.info('A2AClient initialized.')
 
         except Exception as e:
-            logger.error(
-                f'Critical error fetching public agent card: {e}', exc_info=True
+            logger.error(f'Failed to initialize A2A client: {e}', exc_info=True)
+            return
+
+        # --- Warm-up Phase ---
+        logger.info('\n--- Performing warm-up runs to stabilize the system... ---')
+        try:
+            warmup_payload = base64.b64encode(os.urandom(1024)).decode('utf-8')
+            warmup_params = MessageSendParams(
+                message={
+                    'role': 'user',
+                    'parts': [{'kind': 'text', 'text': warmup_payload}],
+                }
             )
-            raise RuntimeError(
-                'Failed to fetch the public agent card. Cannot continue.'
-            ) from e
+            for i in range(5):  # 5 warm-up runs
+                request = SendMessageRequest(id=str(uuid4()), params=warmup_params)
+                await client.send_message(request)
+                logger.info(f'  Warm-up run {i+1} complete.')
+        except Exception as e:
+            logger.warning(f'An error occurred during warm-up: {e}. Continuing with tests.')
 
-        # --8<-- [start:send_message]
-        client = A2AClient(
-            httpx_client=httpx_client, agent_card=final_agent_card_to_use
-        )
-        logger.info('A2AClient initialized.')
+        # --- Latency Test Execution ---
+        logger.info('\n--- Starting formal latency tests... ---')
+        for size_bytes in PAYLOAD_SIZES_BYTES:
+            size_kb = size_bytes // 1024
+            logger.info(f'\n--- Testing with payload size: {size_kb} KB ---')
+            latencies_ms: List[float] = []
 
-        send_message_payload: dict[str, Any] = {
-            'message': {
-                'role': 'user',
-                'parts': [
-                    {'kind': 'text', 'text': 'how much is 10 USD in INR?'}
-                ],
-                'messageId': uuid4().hex,
-            },
-        }
-        request = SendMessageRequest(
-            id=str(uuid4()), params=MessageSendParams(**send_message_payload)
-        )
+            # Generate a single payload for this size to reuse
+            payload_data = base64.b64encode(os.urandom(size_bytes)).decode('utf-8')
 
-        response = await client.send_message(request)
-        print(response.model_dump(mode='json', exclude_none=True))
-        # --8<-- [end:send_message]
+            for i in range(NUM_ITERATIONS):
+                try:
+                    request_params = MessageSendParams(
+                        message={
+                            'role': 'user',
+                            'parts': [{'kind': 'text', 'text': payload_data}],
+                            'messageId': uuid4().hex,
+                        }
+                    )
+                    request = SendMessageRequest(id=str(uuid4()), params=request_params)
 
-        # --8<-- [start:send_message_streaming]
+                    start_time = time.monotonic()
+                    response = await client.send_message(request)
+                    end_time = time.monotonic()
 
-        streaming_request = SendStreamingMessageRequest(
-            id=str(uuid4()), params=MessageSendParams(**send_message_payload)
-        )
+                    # Validate response by accessing the nested structure
+                    if (
+                        response.root
+                        and isinstance(response.root, SendMessageSuccessResponse)
+                        and response.root.result
+                        and isinstance(response.root.result, Message)
+                        and response.root.result.parts
+                        and len(response.root.result.parts) > 0
+                        and isinstance(response.root.result.parts[0], Part)
+                        and isinstance(response.root.result.parts[0].root, TextPart)
+                        and response.root.result.parts[0].root.text == payload_data
+                    ):
+                        latency_ms = (end_time - start_time) * 1000
+                        latencies_ms.append(latency_ms)
+                        logger.info(f'  Run {i+1:2d}/{NUM_ITERATIONS}: {latency_ms:8.2f} ms')
+                    else:
+                        logger.warning(f'  Run {i+1:2d}/{NUM_ITERATIONS}: Response validation failed.')
 
-        stream_response = client.send_message_streaming(streaming_request)
+                except Exception as e:
+                    logger.error(f'  Run {i+1:2d}/{NUM_ITERATIONS}: Request failed: {e}')
 
-        async for chunk in stream_response:
-            print(chunk.model_dump(mode='json', exclude_none=True))
-        # --8<-- [end:send_message_streaming]
+            # --- Statistical Calculation ---
+            if latencies_ms:
+                mean_latency = statistics.mean(latencies_ms)
+                std_dev = statistics.stdev(latencies_ms) if len(latencies_ms) > 1 else 0.0
+                all_results[size_kb] = {
+                    'latencies': latencies_ms,
+                    'mean': mean_latency,
+                    'std_dev': std_dev,
+                }
+            else:
+                 logger.warning(f"No successful runs for {size_kb} KB payload. Skipping stats.")
+
+
+    # --- Report Generation ---
+    generate_markdown_report(all_results)
+    logger.info(f'\nTest complete. Report generated at: {REPORT_FILE}')
+
+
+def generate_markdown_report(results: Dict[int, Dict[str, Any]]) -> None:
+    """
+    Generates a markdown report from the test results.
+    """
+    with open(REPORT_FILE, 'w', encoding='utf-8') as f:
+        f.write('# A2A Agent Latency Test Report\n\n')
+        f.write(f'**Date:** {time.strftime("%Y-%m-%d %H:%M:%S")}\n')
+        f.write(f'**Iterations per Payload:** {NUM_ITERATIONS}\n\n')
+
+        # --- Summary Table ---
+        f.write('## Summary\n\n')
+        f.write('| Payload Size (KB) | Mean Latency (ms) | Std Deviation (ms) |\n')
+        f.write('|-------------------|-------------------|--------------------|\n')
+        for size_kb, data in sorted(results.items()):
+            f.write(
+                f'| {size_kb:<17} | {data["mean"]:>17.2f} | {data["std_dev"]:>18.2f} |\n'
+            )
+        f.write('\n')
+
+        # --- Detailed Results ---
+        f.write('## Detailed Results\n\n')
+        for size_kb, data in sorted(results.items()):
+            f.write(f'<details>\n')
+            f.write(f'<summary><strong>{size_kb} KB Payload</strong></summary>\n\n')
+            f.write('| Run # | Latency (ms) |\n')
+            f.write('|-------|--------------|\n')
+            for i, latency in enumerate(data['latencies']):
+                f.write(f'| {i+1:<5} | {latency:>12.2f} |\n')
+            f.write('\n</details>\n\n')
 
 
 if __name__ == '__main__':
-    import asyncio
-
     asyncio.run(main())
