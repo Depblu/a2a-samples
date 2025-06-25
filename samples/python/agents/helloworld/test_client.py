@@ -3,6 +3,7 @@ import base64
 import logging
 import os
 import statistics
+import subprocess
 import time
 from typing import Any, Dict, List
 from uuid import uuid4
@@ -23,7 +24,7 @@ from a2a.types import (
 PAYLOAD_SIZES_KB = [1, 4, 16, 64]  # In Kilobytes
 PAYLOAD_SIZES_BYTES = [s * 1024 for s in PAYLOAD_SIZES_KB]
 NUM_ITERATIONS = 10  # Number of tests per payload size
-REPORT_FILE = 'latency_report.md'
+REPORT_FILE = 'a2a_latency_report.md'
 
 
 async def main() -> None:
@@ -129,11 +130,27 @@ async def main() -> None:
 
 
     # --- Report Generation ---
-    generate_markdown_report(all_results)
+    cpu_info = get_cpu_info()
+    generate_markdown_report(all_results, cpu_info)
     logger.info(f'\nTest complete. Report generated at: {REPORT_FILE}')
 
 
-def generate_markdown_report(results: Dict[int, Dict[str, Any]]) -> None:
+def get_cpu_info() -> str:
+    """
+    Retrieves CPU information using the 'lscpu' command.
+    """
+    try:
+        result = subprocess.run(
+            ['lscpu'], capture_output=True, text=True, check=True
+        )
+        return result.stdout
+    except (subprocess.CalledProcessError, FileNotFoundError) as e:
+        return f'Could not retrieve CPU info: {e}'
+
+
+def generate_markdown_report(
+    results: Dict[int, Dict[str, Any]], cpu_info: str
+) -> None:
     """
     Generates a markdown report from the test results.
     """
@@ -141,6 +158,12 @@ def generate_markdown_report(results: Dict[int, Dict[str, Any]]) -> None:
         f.write('# A2A Agent Latency Test Report\n\n')
         f.write(f'**Date:** {time.strftime("%Y-%m-%d %H:%M:%S")}\n')
         f.write(f'**Iterations per Payload:** {NUM_ITERATIONS}\n\n')
+
+        # --- CPU Info ---
+        f.write('## CPU Info\n\n')
+        f.write('```\n')
+        f.write(cpu_info)
+        f.write('```\n\n')
 
         # --- Summary Table ---
         f.write('## Summary\n\n')
