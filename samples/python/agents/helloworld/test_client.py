@@ -59,6 +59,7 @@ async def main() -> None:
                 message={
                     'role': 'user',
                     'parts': [{'kind': 'text', 'text': warmup_payload}],
+                    'messageId': uuid4().hex,
                 }
             )
             for i in range(5):  # 5 warm-up runs
